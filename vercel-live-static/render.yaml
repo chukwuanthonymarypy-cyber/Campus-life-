@@ -1,8 +1,0 @@
-services:
-  - type: web
-    name: campus-life-live
-    runtime: node
-    plan: free
-    buildCommand: npm ci --omit=dev
-    startCommand: npm start
-    healthCheckPath: /health
