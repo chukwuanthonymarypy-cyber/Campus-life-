@@ -3,6 +3,16 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { WebSocketServer, WebSocket } = require('ws');
+const media=require('./media-server.cjs');
+const admins=new Set(),adminFailures=new Map();
+let adCache=[],adCacheAt=0;
+const adminPassword=process.env.CAMPUS_ADMIN_PASSWORD||'';
+function adminRoster(){return [...users.values()].map(u=>({id:u.id,name:u.name,course:u.course,level:u.level,wallet:u.wallet,room:u.state?.room||'Arriving',hasPicture:!!u.profileUrl}))}
+function updateAdminRoster(){for(const ws of admins)send(ws,{type:'adminRoster',players:adminRoster()})}
+async function updateAdminGallery(){if(!media.mediaReady)return;const photos=await media.readProfiles();for(const ws of admins)send(ws,{type:'adminGallery',photos})}
+async function loadAds(force=false){if(!media.mediaReady)return [];if(!force&&Date.now()-adCacheAt<30000)return adCache;adCache=await media.readAds();adCacheAt=Date.now();return adCache}
+async function notifyAds(){const all=await loadAds(true);for(const ws of users.keys())send(ws,{type:'adsSnapshot',ads:media.activeAds(all)});for(const ws of admins)send(ws,{type:'adminAds',ads:all})}
+setInterval(()=>{if(media.mediaReady)notifyAds().catch(e=>console.warn('Advert refresh failed:',e.message))},60000).unref();
 const port = Number(process.env.PORT || 8000);
 const page = path.join(__dirname,'index.html');
 const messages = [];
@@ -22,14 +32,14 @@ const server = http.createServer((req,res)=>{
   if(req.url==='/health'){res.writeHead(200,{'content-type':'application/json'}).end(JSON.stringify({ok:true,online:users.size}));return}
   res.writeHead(404).end('Not found');
 });
-const wss = new WebSocketServer({server,path:'/ws',maxPayload:2048});
+const wss = new WebSocketServer({server,path:'/ws',maxPayload:410*1024});
 function send(ws,obj){if(ws.readyState===WebSocket.OPEN)ws.send(JSON.stringify(obj))}
 function broadcast(obj){for(const ws of users.keys())send(ws,obj)}
 function playersOnline(){return [...users.values()].map(u=>({id:u.id,name:u.name,course:u.course,level:u.level,state:u.state}))}
 const validCourses=new Set(['cs','medicine','media','business','law','nursing','pharmacy','civil','accounting','economics','architecture','education']);
 function validLevel(n){return [100,200,300,400].includes(n)?n:100}
 function sameScene(a,b){return a.room===b.room&&(a.room==='outside'||a.floor===b.floor&&!!a.private===!!b.private&&(!a.private||a.ownerId===b.ownerId))}
-function count(){broadcast({type:'presence',count:users.size,players:playersOnline()})}
+function count(){broadcast({type:'presence',count:users.size,players:playersOnline()});updateAdminRoster()}
 function clean(s,max){return String(s||'').replace(/[\u0000-\u001f\u007f<>]/g,'').trim().slice(0,max)}
 function error(ws,text){send(ws,{type:'error',text})}
 function activityState(mode){const room=activities[mode];broadcast({type:'activityState',mode,players:room.players.map(p=>({id:p.id,name:p.name})),started:room.started,ends:room.ends,holder:room.players[room.holder]?.id||null,goals:room.goals||0,shots:room.shots||0,notes:room.notes?.size||0,contributors:[...(room.notes||[])]})}
@@ -39,17 +49,68 @@ function joinActivity(ws,user,mode){if(!Object.hasOwn(activities,mode))return er
 setInterval(()=>{for(const [mode,room] of Object.entries(activities))if(room.started&&Date.now()>=room.ends)endActivity(mode,mode==='football')},1000);
 
 wss.on('connection',ws=>{
-  const user={id:crypto.randomUUID(),name:'',course:'cs',level:100,wallet:0,transferIds:new Set(),last:0,window:[],previous:'',state:null,lastState:0,lastDM:0,lastClub:0,lastYield:0,pendingInvites:new Map(),allowedRooms:new Map()};
+  const user={id:crypto.randomUUID(),name:'',course:'cs',level:100,wallet:0,transferIds:new Set(),last:0,window:[],previous:'',state:null,lastState:0,lastDM:0,lastClub:0,lastYield:0,pendingInvites:new Map(),allowedRooms:new Map(),admin:false,adminBusy:false,adminAttempts:0,profileUrl:''};
   ws.on('message',raw=>{
+    if(raw.length>4096&&!user.admin){ws.close(1009,'Message too large');return}
     let data;try{data=JSON.parse(raw)}catch{return error(ws,'Message was not understood.')}
+    if(data.type==='adminAuth'){
+      const ip=String(ws._socket?.remoteAddress||''),rec=adminFailures.get(ip)||{attempts:0,until:0};
+      if(!adminPassword||adminPassword.length<12)return send(ws,{type:'adminError',text:'Set a server-side CAMPUS_ADMIN_PASSWORD (12+ characters) first.'});
+      if(rec.until>Date.now()||user.adminAttempts>=5)return send(ws,{type:'adminError',text:'Too many attempts. Try later.'});
+      const typed=typeof data.password==='string'&&data.password.length<=256?data.password:'';
+      const correct=crypto.timingSafeEqual(crypto.createHash('sha256').update(typed).digest(),crypto.createHash('sha256').update(adminPassword).digest());
+      if(!correct){user.adminAttempts++;rec.attempts++;rec.until=rec.attempts>=5?Date.now()+15*60*1000:0;adminFailures.set(ip,rec);return send(ws,{type:'adminError',text:'Incorrect password.'})}
+      adminFailures.delete(ip);user.admin=true;admins.add(ws);send(ws,{type:'adminWelcome',players:adminRoster(),storageReady:media.mediaReady});
+      loadAds().then(ads=>send(ws,{type:'adminAds',ads})).catch(e=>send(ws,{type:'adminError',text:'Could not load adverts: '+e.message}));updateAdminGallery().catch(()=>{});return;
+    }
+    if(data.type==='adminTopUp'||data.type==='adminAdSave'||data.type==='adminAdDelete'||data.type==='adminProfileRemove'){
+      if(!user.admin)return error(ws,'Administrator login required.');
+      if(data.type==='adminTopUp'){
+        const amount=Number(data.amount),target=[...users].find(([,u])=>u.id===data.toId);
+        if(!target||target[0].readyState!==WebSocket.OPEN)return send(ws,{type:'adminError',text:'This player is no longer online.'});
+        if(!Number.isSafeInteger(amount)||amount<1||amount>1000000||!Number.isSafeInteger(target[1].wallet+amount))return send(ws,{type:'adminError',text:'Enter a whole-naira amount between ₦1 and ₦1,000,000.'});
+        target[1].wallet+=amount;const grantId=crypto.randomUUID();
+        send(target[0],{type:'adminGrant',id:grantId,amount});send(ws,{type:'adminNotice',text:`Added ₦${amount.toLocaleString('en-NG')} in fictional money to ${target[1].name}.`});updateAdminRoster();return;
+      }
+      if(data.type==='adminProfileRemove'){
+        const target=[...users].find(([,u])=>u.id===data.toId||u.profileId===data.profileId);
+        const profileId=target?.[1].profileId||data.profileId;
+        if(typeof profileId!=='string'||!/^[0-9a-f-]{36}$/i.test(profileId))return send(ws,{type:'adminError',text:'Choose a valid public picture.'});
+        if(!media.mediaReady)return send(ws,{type:'adminError',text:'Supabase is not configured.'});
+        if(user.adminBusy)return send(ws,{type:'adminError',text:'Wait for the previous operation to finish.'});
+        user.adminBusy=true;media.removeProfile(profileId).then(async()=>{if(target){target[1].profileUrl='';updateAdminRoster();if(target[1].state){target[1].state.profileUrl='';count();for(const peer of users.keys())if(peer!==target[0])send(peer,{type:'playerState',id:target[1].id,state:target[1].state})}send(target[0],{type:'profileRemoved'})}send(ws,{type:'adminNotice',text:'Public profile picture removed.'});await updateAdminGallery()}).catch(e=>send(ws,{type:'adminError',text:'Could not remove picture: '+e.message})).finally(()=>user.adminBusy=false);return;
+      }
+      if(user.adminBusy)return send(ws,{type:'adminError',text:'Wait for the previous advert operation to finish.'});
+      if(!media.mediaReady)return send(ws,{type:'adminError',text:'Configure Supabase Storage on Render to save adverts.'});
+      if(data.type==='adminAdDelete'){
+        if(!/^[0-9a-f-]{36}$/i.test(data.id||''))return;
+        user.adminBusy=true;media.deleteAd(data.id).then(ok=>{send(ws,{type:'adminNotice',text:ok?'Advert deleted.':'Advert not found.'});return notifyAds()}).catch(e=>send(ws,{type:'adminError',text:'Could not delete advert: '+e.message})).finally(()=>{user.adminBusy=false});return;
+      }
+      const title=clean(data.title,60),ids=Array.isArray(data.boardIds)?[...new Set(data.boardIds)]:[],startsOn=data.startsOn,endsOn=data.endsOn;
+      let link;try{link=new URL(String(data.linkUrl||''))}catch{return send(ws,{type:'adminError',text:'Enter a valid HTTPS owner link.'})}
+      const validDate=x=>typeof x==='string'&&/^\d{4}-\d{2}-\d{2}$/.test(x)&&Number.isFinite(Date.parse(x))&&new Date(x).toISOString().slice(0,10)===x;
+      if(title.length<2||link.protocol!=='https:'||link.username||link.password||link.href.length>500||!validDate(startsOn)||!validDate(endsOn)||startsOn>endsOn||!ids.length||ids.length>26||ids.some(id=>typeof id!=='string'||!/^A([1-9]|1[0-9]|2[0-6])$/.test(id)))return send(ws,{type:'adminError',text:'Check title, HTTPS link, board selection and start/end dates.'});
+      if(typeof data.image!=='string'||data.image.length>375000||!/^[A-Za-z0-9+/]+={0,2}$/.test(data.image))return send(ws,{type:'adminError',text:'Choose a JPEG picture under 270 KB.'});
+      const bytes=Buffer.from(data.image,'base64');if(bytes.length<500||bytes.length>270000||bytes[0]!==255||bytes[1]!==216||bytes.at(-2)!==255||bytes.at(-1)!==217)return send(ws,{type:'adminError',text:'The picture must be a valid JPEG under 270 KB.'});
+      user.adminBusy=true;media.addAd({title,linkUrl:link.href,boardIds:ids,startsOn,endsOn,bytes}).then(()=>{send(ws,{type:'adminNotice',text:'Advert saved. It will appear during its scheduled dates.'});return notifyAds()}).catch(e=>send(ws,{type:'adminError',text:'Could not save advert: '+e.message})).finally(()=>{user.adminBusy=false});return;
+    }
     if(data.type==='join'){
       if(user.name)return;
       const name=clean(data.name,18);
       if(name.length<2)return error(ws,'Choose a name with at least 2 characters.');
       user.name=name;user.course=validCourses.has(data.course)?data.course:'cs';user.level=validLevel(data.level);user.wallet=Number.isSafeInteger(data.wallet)&&data.wallet>=0?data.wallet:0;users.set(ws,user);
-      send(ws,{type:'welcome',id:user.id,messages:messages.slice(-40),count:users.size,players:playersOnline()});count();for(const mode of Object.keys(activities))activityState(mode);return;
+      send(ws,{type:'welcome',id:user.id,messages:messages.slice(-40),count:users.size,players:playersOnline()});count();loadAds().then(ads=>send(ws,{type:'adsSnapshot',ads:media.activeAds(ads)})).catch(()=>{});for(const mode of Object.keys(activities))activityState(mode);return;
     }
     if(!user.name)return error(ws,'Join the campus chat first.');
+    if(data.type==='profileLogout'){user.profileId='';user.profileUrl='';updateAdminRoster();if(user.state){user.state.profileUrl='';count();for(const peer of users.keys())if(peer!==ws)send(peer,{type:'playerState',id:user.id,state:user.state})}return}
+    if(data.type==='profileAuth'){
+      if(!media.mediaReady)return error(ws,'Profile pictures need Supabase configuration.');
+      media.profileForToken(data.token).then(profile=>{
+        if(!profile)return error(ws,'Profile login expired. Sign in again.');
+        user.profileId=profile.id;user.profileUrl=profile.url;updateAdminRoster();if(user.state){user.state.profileUrl=user.profileUrl;count();for(const peer of users.keys())if(peer!==ws)send(peer,{type:'playerState',id:user.id,state:user.state})}
+        send(ws,{type:'profileReady',url:user.profileUrl});updateAdminGallery().catch(()=>{});
+      }).catch(()=>error(ws,'Could not verify profile. Try again.'));return;
+    }
     if(data.type==='heartbeat'){send(ws,{type:'heartbeat'});return;}
     if(data.type==='playerState'){
       const now=Date.now();if(now-user.lastState<90)return;
@@ -57,7 +118,7 @@ wss.on('connection',ws=>{
       const room=clean(v.room,38),outfit=clean(v.outfit,32),floor=Number(v.floor),ownerId=clean(v.ownerId,40);
       if(!/^(outside|[a-zA-Z][a-zA-Z0-9-]{0,36})$/.test(room)||!Number.isInteger(floor)||floor<0||floor>3||!/^[-a-z0-9]{1,32}$/i.test(outfit))return;
       if(v.private&&ownerId!==user.id){const invite=user.allowedRooms.get(ownerId);if(!invite||invite.kind!==room||invite.floor!==floor)return error(ws,'That bedroom is invitation-only.');}
-      const candidate={x:Math.max(-260,Math.min(260,v.x)),z:Math.max(-260,Math.min(260,v.z)),dir:v.dir,room,floor,private:!!v.private,ownerId:v.private?ownerId:'',outfit,avatarStyle:['m1','m2','m3','f1','f2','f3'].includes(v.avatarStyle)?v.avatarStyle:'',schoolBag:!!v.schoolBag,riding:!!v.riding,resting:!!v.resting,seated:!!v.seated,performing:!!v.performing};
+      const candidate={x:Math.max(-260,Math.min(260,v.x)),z:Math.max(-260,Math.min(260,v.z)),dir:v.dir,room,floor,private:!!v.private,ownerId:v.private?ownerId:'',outfit,avatarStyle:['m1','m2','m3','f1','f2','f3'].includes(v.avatarStyle)?v.avatarStyle:'',schoolBag:!!v.schoolBag,riding:!!v.riding,resting:!!v.resting,seated:!!v.seated,performing:!!v.performing,profileUrl:user.profileUrl};
       if(!candidate.riding&&user.state&&sameScene(candidate,user.state))for(const peer of users.values()){
         if(peer===user||!peer.state||peer.state.riding||!sameScene(candidate,peer.state))continue;
         const vx=candidate.x-user.state.x,vz=candidate.z-user.state.z,oldGap=Math.hypot(user.state.x-peer.state.x,user.state.z-peer.state.z),gap=Math.hypot(candidate.x-peer.state.x,candidate.z-peer.state.z),t=Math.max(0,Math.min(1,((peer.state.x-user.state.x)*vx+(peer.state.z-user.state.z)*vz)/(vx*vx+vz*vz||1))),closest=Math.hypot(user.state.x+vx*t-peer.state.x,user.state.z+vz*t-peer.state.z);
@@ -111,7 +172,7 @@ wss.on('connection',ws=>{
     // Session-local, fictional wallets. The browser save remains the source of truth on reconnect.
     // There are no accounts or real-money transfers; clients can edit local saves in this prototype.
     if(data.type==='walletSync'){
-      if(Number.isSafeInteger(data.wallet)&&data.wallet>=0)user.wallet=data.wallet;
+      if(Number.isSafeInteger(data.wallet)&&data.wallet>=0){user.wallet=data.wallet;updateAdminRoster()}
       return;
     }
     if(data.type==='transfer'){
@@ -126,7 +187,7 @@ wss.on('connection',ws=>{
       if(user.wallet<amount)return fail('Insufficient wallet balance. No money was sent.');
       if(!Number.isSafeInteger(target.wallet+amount))return fail('Recipient balance is too high for this transfer.');
       user.transferIds.add(requestId);if(user.transferIds.size>100)user.transferIds.delete(user.transferIds.values().next().value);
-      user.wallet-=amount;target.wallet+=amount;
+      user.wallet-=amount;target.wallet+=amount;updateAdminRoster();
       send(recipientSocket,{type:'transferReceived',id:user.id+':'+requestId,fromName:user.name,amount});
       send(ws,{type:'transferResult',requestId,ok:true,toName:target.name,amount});
       return;
@@ -170,7 +231,7 @@ wss.on('connection',ws=>{
       if(set.size>=3){messages.splice(messages.indexOf(msg),1);reports.delete(msg.id);broadcast({type:'remove',id:msg.id})}
     }
   });
-  ws.on('close',()=>{leaveActivity(ws);if(users.delete(ws)){for(const [peer,other] of users){other.pendingInvites.delete(user.id);if(other.allowedRooms.delete(user.id))send(peer,{type:'roomInviteRevoked',fromId:user.id})}count()}});
+  ws.on('close',()=>{admins.delete(ws);leaveActivity(ws);if(users.delete(ws)){for(const [peer,other] of users){other.pendingInvites.delete(user.id);if(other.allowedRooms.delete(user.id))send(peer,{type:'roomInviteRevoked',fromId:user.id})}count()}});
   ws.on('error',()=>{});
 });
 server.listen(port,'0.0.0.0',()=>console.log(`Campus Life listening on 0.0.0.0:${port}`));
